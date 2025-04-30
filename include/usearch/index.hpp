@@ -7,6 +7,24 @@
 #ifndef UNUM_USEARCH_HPP
 #define UNUM_USEARCH_HPP
 
+#if (WITH_VECTOR_STORE)
+#include "eval_utils.h"
+#include "tx_execution.h"
+#include "tx_operation.h"
+#include "type.h"
+#include "vector_command.h"
+#include "vector_key.h"
+#include "vector_neighbour_record.h"
+#include "vector_record.h"
+#include "vector_utils.h"
+#endif
+
+#include <array>
+#include <cassert>
+#include <cstddef>
+#include <string>
+#include <string_view>
+#include <vector>
 #define USEARCH_VERSION_MAJOR 2
 #define USEARCH_VERSION_MINOR 17
 #define USEARCH_VERSION_PATCH 2
@@ -154,6 +172,12 @@
 #define usearch_noexcept_m
 #endif
 
+#if (WITH_VECTOR_STORE)
+#include "vector_store_interface.h"
+using namespace EloqVec;
+using namespace Evaluation;
+#endif
+
 extern "C" {
 /// @brief  Helper function to simplify debugging - trace just one symbol - `__usearch_raise_runtime_error`.
 ///         Assuming the `extern C` block, the name won't be mangled.
@@ -167,6 +191,59 @@ inline static void __usearch_raise_runtime_error(char const* message) {
 #endif
 }
 }
+
+#if (WITH_VECTOR_STORE)
+
+namespace EloqVec {
+
+template <typename vector_key_t> struct VectorKeyPtr {
+
+    static const vector_key_t* vector_default_ptr;
+    VectorKeyPtr() : ptr(vector_default_ptr) {}
+
+    VectorKeyPtr(const vector_key_t* pkey) : ptr(pkey) {}
+
+    const vector_key_t* operator()() const noexcept { return ptr; }
+
+    friend bool operator==(const VectorKeyPtr& lhs, const VectorKeyPtr& rhs) {
+        if (lhs.ptr == vector_default_ptr || rhs.ptr == vector_default_ptr) {
+            return lhs.ptr == rhs.ptr;
+        }
+        return *lhs.ptr == *rhs.ptr;
+    }
+
+    friend bool operator!=(const VectorKeyPtr& lhs, const VectorKeyPtr& rhs) {
+        if (lhs.ptr == vector_default_ptr || rhs.ptr == vector_default_ptr) {
+            return lhs.ptr != rhs.ptr;
+        }
+        assert(false);
+        return true;
+    }
+
+    const vector_key_t* ptr;
+};
+
+// Define the static member outside the class
+template <typename vector_key_t>
+const vector_key_t*
+    VectorKeyPtr<vector_key_t>::vector_default_ptr = reinterpret_cast<const vector_key_t*>(0xFFFFFFFFFFFFFFFF);
+
+} // namespace EloqVec
+
+namespace std {
+// using namespace unum::usearch;
+
+template <> struct hash<VectorKeyPtr<VectorKey>> {
+    std::size_t operator()(VectorKeyPtr<VectorKey> k) const { return k.ptr->Hash(); }
+};
+
+template <> struct hash<VectorKeyPtr<VectorIntegerKey>> {
+    std::size_t operator()(VectorKeyPtr<VectorIntegerKey> k) const { return k.ptr->Hash(); }
+};
+
+} // namespace std
+
+#endif
 
 namespace unum {
 namespace usearch {
@@ -1366,6 +1443,10 @@ struct index_config_t {
     /// > It is called `M0` in the paper.
     std::size_t connectivity_base = default_connectivity() * 2;
 
+#if (WITH_VECTOR_STORE)
+    std::string_view table_name;
+#endif
+
     inline index_config_t() = default;
     inline index_config_t(std::size_t c, std::size_t cb = 0) noexcept : connectivity(c), connectivity_base(cb) {}
 
@@ -2089,17 +2170,44 @@ class index_gt {
         std::size_t neighbors_bytes{};
         std::size_t neighbors_base_bytes{};
     };
+
+#if (WITH_VECTOR_STORE)
+    // using eloq_visits_hash_set_t = growing_hash_set_gt<const vector_key_t*, hash_gt<const vector_key_t*>,
+    // dynamic_allocator_t>;
+    using eloq_visits_hash_set_t =
+        growing_hash_set_gt<EloqVec::VectorKeyPtr<vector_key_t>, hash_gt<EloqVec::VectorKeyPtr<vector_key_t>>,
+                            dynamic_allocator_t>;
+    template <typename slot_t = compressed_slot_t> struct eloq_candidate_t {
+        distance_t distance;
+        slot_t slot;
+        inline bool operator<(eloq_candidate_t other) const noexcept { return distance < other.distance; }
+    };
+    using candidate_t = eloq_candidate_t<>;
+    using vector_candidate_t = eloq_candidate_t<const vector_key_t*>;
+#else
     /// @brief A space-efficient internal data-structure used in graph traversal queues.
     struct candidate_t {
         distance_t distance;
         compressed_slot_t slot;
         inline bool operator<(candidate_t other) const noexcept { return distance < other.distance; }
     };
+#endif
 
     using candidates_view_t = span_gt<candidate_t const>;
     using candidates_allocator_t = typename dynamic_allocator_traits_t::template rebind_alloc<candidate_t>;
     using top_candidates_t = sorted_buffer_gt<candidate_t, std::less<candidate_t>, candidates_allocator_t>;
     using next_candidates_t = max_heap_gt<candidate_t, std::less<candidate_t>, candidates_allocator_t>;
+
+#if (WITH_VECTOR_STORE)
+    using eloq_candidates_view_t = span_gt<vector_candidate_t const>;
+    using eloq_candidates_allocator_t = typename dynamic_allocator_traits_t::template rebind_alloc<vector_candidate_t>;
+    using eloq_top_candidates_t =
+        sorted_buffer_gt<vector_candidate_t, std::less<vector_candidate_t>, eloq_candidates_allocator_t>;
+    using eloq_next_candidates_t =
+        max_heap_gt<vector_candidate_t, std::less<vector_candidate_t>, eloq_candidates_allocator_t>;
+    using eloq_candidate_list_t = std::list<vector_key_t>;
+    // using eloq_candidate_list_t = std::vector<vector_key_t>;
+#endif
 
     /**
      *  @brief  A loosely-structured handle for every node. One such node is created for every member.
@@ -2186,6 +2294,25 @@ class index_gt {
         top_candidates_t top_for_refine{};
         next_candidates_t next_candidates{};
         visits_hash_set_t visits{};
+
+#if (WITH_VECTOR_STORE)
+
+        eloq_top_candidates_t eloq_top_candidates{};
+        eloq_top_candidates_t eloq_top_for_refine{};
+        eloq_next_candidates_t eloq_next_candidates{};
+        eloq_visits_hash_set_t eloq_visits{};
+        /**
+         *  @brief  Manages lifecycle of cached vector keys which may represent non-trivial data structures
+         *          (not natively supported by usearch data structure like max_heap_gt).
+         *
+         *          The solution employs a dual approach:
+         *              Pointer storage:   Vector key references are retained in max_heap_gt for efficient access
+         *              Memory management: A dedicated list structure maintains ownership and ensures proper
+         *                                 resource cleanup of the underlying vector key data.
+         */
+        eloq_candidate_list_t eloq_cache_candidates{};
+#endif
+
         std::default_random_engine level_generator{};
         std::size_t iteration_cycles{};
         std::size_t computed_distances{};
@@ -2206,10 +2333,11 @@ class index_gt {
         /// @brief Homogeneous distance calculation.
         template <typename metric_at, typename entry_at> //
         inline distance_t measure(entry_at const& first, entry_at const& second, metric_at&& metric) noexcept {
+#if (!WITH_VECTOR_STORE)
             static_assert( //
                 std::is_same<entry_at, member_cref_t>::value || std::is_same<entry_at, member_citerator_t>::value,
                 "Unexpected type");
-
+#endif
             computed_distances++;
             return metric(first, second);
         }
@@ -2435,6 +2563,15 @@ class index_gt {
      *  If the index is memory-mapped - releases the mapping and the descriptor.
      */
     void reset() noexcept {
+#if (WITH_VECTOR_STORE)
+        while (!free_contexts_.empty()) {
+            context_t* ctx = free_contexts_.front();
+            unum::usearch::destroy_at(ctx);
+            contexts_allocator_t{}.deallocate(ctx, 1);
+            free_contexts_.pop();
+        }
+#endif
+
         clear();
 
         nodes_ = {};
@@ -2522,6 +2659,45 @@ class index_gt {
      */
     bool reserve(index_limits_t limits) usearch_noexcept_m { return try_reserve(limits); }
 
+#if (WITH_VECTOR_STORE)
+    static thread_local std::queue<context_t*> free_contexts_;
+
+    static context_t* new_context() {
+        context_t* ctx = nullptr;
+
+        if (free_contexts_.empty()) {
+            DLOG(INFO) << "[index_gt]create a new context";
+            ctx = contexts_allocator_t{}.allocate(1);
+            if (!ctx) {
+                return nullptr;
+            }
+            construct_at(ctx);
+            // TODO(ycw): just for test, delete this later
+            // ctx->eloq_cache_candidates.reserve(10000);
+        } else {
+            ctx = free_contexts_.front();
+            free_contexts_.pop();
+        }
+
+        return ctx;
+    }
+
+    static void return_context(context_t* ctx) { free_contexts_.push(ctx); }
+
+    struct context_wrapper {
+        context_wrapper() : ctx_(new_context()) {}
+        ~context_wrapper() { return_context(ctx_); }
+
+        context_wrapper(const context_wrapper&) = delete;
+        context_wrapper& operator=(const context_wrapper&) = delete;
+        context_wrapper(context_wrapper&& other) = delete;
+        context_wrapper& operator=(context_wrapper&& other) = delete;
+
+        context_t* ctx_;
+    };
+
+#endif
+
 #if defined(USEARCH_USE_PRAGMA_REGION)
 #pragma endregion
 
@@ -2543,6 +2719,24 @@ class index_gt {
             return std::move(*this);
         }
     };
+
+#if (WITH_VECTOR_STORE)
+    struct eloq_add_result_t {
+        VectorStoreError status = VectorStoreError::NoError;
+        std::size_t new_size{};
+        std::size_t visited_members{};
+        std::size_t computed_distances{};
+        std::size_t computed_distances_in_refines{};
+        std::size_t computed_distances_in_reverse_refines{};
+        compressed_slot_t slot{};
+
+        explicit operator bool() const noexcept { return status == VectorStoreError::NoError; }
+        eloq_add_result_t failed(VectorStoreError err) noexcept {
+            status = err;
+            return std::move(*this);
+        }
+    };
+#endif
 
     /// @brief  Describes a matched search result, augmenting `member_cref_t`
     ///         contents with `distance` to the query object.
@@ -2667,6 +2861,16 @@ class index_gt {
             return count;
         }
 
+#if (WITH_VECTOR_STORE)
+        inline std::size_t dump_to(std::pair<vector_key_t, distance_t>* results) const noexcept {
+            for (std::size_t i = 0; i != count; ++i) {
+                match_t result = operator[](i);
+                results[i] = {result.member.key, result.distance};
+            }
+            return count;
+        }
+#endif
+
         /**
          *  @brief  Extracts the search results into a user-provided buffer.
          *  @return The number of results stored in the buffer.
@@ -2680,6 +2884,161 @@ class index_gt {
             return count;
         }
     };
+
+#if (WITH_VECTOR_STORE)
+
+    struct eloq_match_t {
+        vector_key_t key;
+        distance_t distance;
+
+        inline eloq_match_t() noexcept : key(), distance(std::numeric_limits<distance_t>::max()) {}
+
+        inline eloq_match_t(const vector_key_t& key, distance_t distance) noexcept : key(key), distance(distance) {}
+
+        inline eloq_match_t(vector_key_t&& key, distance_t distance) noexcept
+            : key(std::move(key)), distance(distance) {}
+
+        inline eloq_match_t(eloq_match_t&& other) noexcept : key(std::move(other.key)), distance(other.distance) {}
+
+        inline eloq_match_t(const eloq_match_t& other) noexcept : key(other.key), distance(other.distance) {}
+
+        inline eloq_match_t& operator=(const eloq_match_t& other) noexcept {
+            if (this == &other) {
+                return *this;
+            }
+            key = other.key;
+            distance = other.distance;
+            return *this;
+        }
+    };
+
+    class eloq_search_result_t {
+        std::vector<eloq_match_t> matches;
+
+      public:
+        inline eloq_search_result_t() noexcept = default;
+
+        inline eloq_search_result_t(eloq_search_result_t&& other) noexcept = default;
+
+        inline eloq_search_result_t(const eloq_top_candidates_t& top) noexcept : count(top.size()) {
+            const vector_candidate_t* top_ordered = top.data();
+            matches.reserve(count);
+            for (std::size_t i = 0; i != count; ++i) {
+                // TODO(ycw): check std::move
+                matches.emplace_back(std::move(*top_ordered[i].slot), top_ordered[i].distance);
+            }
+        }
+
+        /**  @brief  Number of search results found. */
+        std::size_t count{};
+        /**  @brief  Number of graph nodes traversed. */
+        std::size_t visited_members{};
+        /**  @brief  Number of times the distances were computed. */
+        std::size_t computed_distances{};
+        VectorStoreError status = VectorStoreError::NoError;
+
+        explicit operator bool() const noexcept { return status == VectorStoreError::NoError; }
+
+        eloq_search_result_t failed(VectorStoreError message) noexcept {
+            status = message;
+            return std::move(*this);
+        }
+
+        inline void set_result(const eloq_top_candidates_t& top) {
+            matches.clear();
+            count = top.size();
+            const vector_candidate_t* top_ordered = top.data();
+            matches.reserve(count);
+            for (std::size_t i = 0; i != count; ++i) {
+                // TODO(ycw): check std::move
+                matches.emplace_back(*top_ordered[i].slot, top_ordered[i].distance);
+            }
+        }
+
+        inline operator std::size_t() const noexcept { return count; }
+        inline std::size_t size() const noexcept { return count; }
+        inline bool empty() const noexcept { return count == 0u; }
+        inline eloq_match_t operator[](std::size_t i) const noexcept { return at(i); }
+        inline match_t front() const noexcept { return at(0); }
+        inline match_t back() const noexcept { return at(count - 1); }
+        inline bool contains(const vector_key_t& key) const noexcept {
+            for (std::size_t i = 0; i != count; ++i) {
+                if (at(i).key == key) {
+                    return true;
+                }
+            }
+            return false;
+        }
+        inline eloq_match_t at(std::size_t i) const noexcept { return matches[i]; }
+
+        /**
+         *  @brief  Extracts the search results into a user-provided buffer, that unlike `dump_to`,
+         *          may already contain some data, so the new and old results are merged together.
+         *  @return The number of results stored in the buffer.
+         *  @param[in] keys The buffer to store the keys of the search results.
+         *  @param[in] distances The buffer to store the distances to the search results.
+         *  @param[in] old_count The number of results already stored in the buffers.
+         *  @param[in] max_count The maximum number of results that can be stored in the buffers.
+         */
+        inline std::size_t merge_into(                 //
+            vector_key_t* keys, distance_t* distances, //
+            std::size_t old_count, std::size_t max_count) const noexcept {
+
+            assert(false);
+            return 0;
+            // std::size_t merged_count = old_count;
+            // for (std::size_t i = 0; i != count; ++i) {
+            //     match_t result = operator[](i);
+            //     distance_t* merged_end = distances + merged_count;
+            //     std::size_t offset = std::lower_bound(distances, merged_end, result.distance) - distances;
+            //     if (offset == max_count)
+            //         continue;
+
+            //     std::size_t count_worse = merged_count - offset - (max_count == merged_count);
+            //     std::memmove(keys + offset + 1, keys + offset, count_worse * sizeof(vector_key_t));
+            //     std::memmove(distances + offset + 1, distances + offset, count_worse * sizeof(distance_t));
+            //     keys[offset] = result.member.key;
+            //     distances[offset] = result.distance;
+            //     merged_count += merged_count != max_count;
+            // }
+            // return merged_count;
+        }
+
+        /**
+         *  @brief  Extracts the search results into a user-provided buffer.
+         *  @return The number of results stored in the buffer.
+         *  @param[in] keys The buffer to store the keys of the search results.
+         *  @param[in] distances The buffer to store the distances to the search results.
+         */
+        inline std::size_t dump_to(vector_key_t* keys, distance_t* distances) const noexcept {
+            for (std::size_t i = 0; i != count; ++i) {
+                keys[i] = std::move(matches[i].key);
+                distances[i] = matches[i].distance;
+            }
+            return count;
+        }
+
+        /**
+         *  @brief  Extracts the search results into a user-provided buffer.
+         *  @return The number of results stored in the buffer.
+         *  @param[in] keys The buffer to store the keys of the search results.
+         */
+        inline std::size_t dump_to(vector_key_t* keys) const noexcept {
+            for (std::size_t i = 0; i != count; ++i) {
+                keys[i] = std::move(matches[i].key);
+            }
+            return count;
+        }
+
+        inline std::size_t dump_to(std::pair<vector_key_t, distance_t>* results) const noexcept {
+            for (std::size_t i = 0; i != count; ++i) {
+                results[i] = {std::move(matches[i].key), matches[i].distance};
+            }
+            return count;
+        }
+    };
+
+#endif
 
     struct cluster_result_t {
         error_t error{};
@@ -2818,6 +3177,136 @@ class index_gt {
         }
         return result;
     }
+
+#if (WITH_VECTOR_STORE)
+
+    template <                                   //
+        typename value_at,                       //
+        typename metric_at,                      //
+        typename callback_at = dummy_callback_t, //
+        typename prefetch_at = dummy_prefetch_t  //
+        >
+    eloq_add_result_t add(const EloqVecTableName& table_name, const vector_key_t& key, value_at&& value,
+                          metric_at&& metric,                                                        //
+                          txservice::TransactionExecution* txm,                                      //
+                          HNSWMetaRecord<vector_key_t>& metadata, index_update_config_t config = {}, //
+                          prefetch_at&& prefetch = prefetch_at{}) usearch_noexcept_m {
+        eloq_add_result_t result;
+
+        // First check if key is exist
+        VectorRecord vec_record;
+        VectorStoreError status =
+            VectorStoreInterface::GetVector(table_name.data_table_name, key, vec_record, txm, false);
+        if (status == VectorStoreError::NoError) {
+            if (vec_record.IsDeleted()) {
+                status = VectorStoreError::IsDeleted;
+            } else {
+                status = VectorStoreError::IsExist;
+            }
+            return result.failed(status);
+        }
+
+        if (status != VectorStoreError::NotFoundKey) {
+            return result.failed(status);
+        }
+
+        // Make sure we have enough local memory to perform this request
+        // context_t& context = contexts_[config.thread];
+        context_wrapper ctx_wrapper;
+        context_t& context = *ctx_wrapper.ctx_;
+        eloq_top_candidates_t& top = context.eloq_top_candidates;
+        eloq_next_candidates_t& next = context.eloq_next_candidates;
+        top.clear();
+        next.clear();
+
+        // The top list needs one more slot than the connectivity of the base level
+        // for the heuristic, that tries to squeeze one more element into saturated list.
+        std::size_t connectivity_max = (std::max)(config_.connectivity_base, config_.connectivity);
+        std::size_t top_limit = (std::max)(connectivity_max + 1, config.expansion);
+        if (!top.reserve(top_limit))
+            return result.failed(VectorStoreError::OutOfMemory);
+        if (!next.reserve(config.expansion))
+            return result.failed(VectorStoreError::OutOfMemory);
+
+        level_t max_level_copy = metadata.max_level_;
+        vector_key_t closest_key = metadata.entry_key_;
+
+        level_t new_target_level = choose_random_level_(context.level_generator);
+
+        // insert new vector data into vector store
+        VectorStoreInterface::UpsertVector(table_name.data_table_name, key, value, txm);
+
+        // create neighbour record for new node
+        VectorNeighbourRecord<vector_key_t> neighbour_record{new_target_level};
+        // If no elements in vector store, just return
+        if (metadata.max_level_ == -1) {
+            // insert neighbour record of new vector into vector store
+            VectorStoreInterface::UpsertNeighborRecord(table_name.neighbour_table_name, key,
+                                                       std::move(neighbour_record), txm);
+
+            // update meta record in vector store
+            metadata.max_level_ = new_target_level;
+            metadata.entry_key_ = key;
+            VectorStoreInterface::UpsertHNSWMetaRecord(table_name.metadata_key, std::move(metadata), txm);
+            result.status = VectorStoreError::NoError;
+            return result;
+        }
+        // Pull stats
+        result.computed_distances = context.computed_distances;
+        result.computed_distances_in_refines = context.computed_distances_in_refines;
+        result.computed_distances_in_reverse_refines = context.computed_distances_in_reverse_refines;
+        result.visited_members = context.iteration_cycles;
+
+        result.status = search_for_one_(table_name, value, metric, txm, prefetch, closest_key, max_level_copy,
+                                        new_target_level, context);
+        if (result.status != VectorStoreError::NoError) {
+            return result;
+        }
+
+        // From `new_target_level` down - perform proper extensive search
+        for (level_t level = (std::min)(new_target_level, max_level_copy); level >= 0; --level) {
+            result.status = search_to_insert_(table_name, value, metric, txm, prefetch, closest_key, level,
+                                              config.expansion, context);
+            if (result.status != VectorStoreError::NoError) {
+                return result;
+            }
+            eloq_candidates_view_t closest_view;
+            {
+                result.status = form_links_to_closest_(table_name.data_table_name, metric, neighbour_record, level, txm,
+                                                       context, closest_view);
+                if (result.status != VectorStoreError::NoError) {
+                    return result;
+                }
+                closest_key = *(closest_view[0].slot);
+            }
+            result.status = form_reverse_links_(table_name, metric, key, closest_view, value, level, txm, context);
+            if (result.status != VectorStoreError::NoError) {
+                return result;
+            }
+        }
+
+        // Normalize stats
+        result.computed_distances = context.computed_distances - result.computed_distances;
+        result.computed_distances_in_refines =
+            context.computed_distances_in_refines - result.computed_distances_in_refines;
+        result.computed_distances_in_reverse_refines =
+            context.computed_distances_in_reverse_refines - result.computed_distances_in_reverse_refines;
+        result.visited_members = context.iteration_cycles - result.visited_members;
+
+        if (new_target_level > max_level_copy) {
+            metadata.entry_key_ = key;
+            metadata.max_level_ = new_target_level;
+            VectorStoreInterface::UpsertHNSWMetaRecord(table_name.metadata_key, std::move(metadata), txm,
+                                                       OperationType::Update);
+        }
+
+        VectorStoreInterface::UpsertNeighborRecord(table_name.neighbour_table_name, key, std::move(neighbour_record),
+                                                   txm, OperationType::Update);
+
+        return result;
+    }
+
+#endif
 
     /**
      *  @brief  Update an existing entry. Thread-safe. Supports @b heterogeneous lookups.
@@ -3013,6 +3502,131 @@ class index_gt {
         result.count = top.size();
         return result;
     }
+
+#if (WITH_VECTOR_STORE)
+
+    /**
+     *  @brief Searches for the closest elements to the given ::query. Thread-safe.
+     *
+     *  @param[in] query Content that will be compared against other entries in the index.
+     *  @param[in] wanted The upper bound for the number of results to return.
+     *  @param[in] config Configuration options for this specific operation.
+     *  @param[in] predicate Optional filtering predicate for `member_cref_t`.
+     *  @return Smart object referencing temporary memory. Valid until next `search()`, `add()`, or `cluster()`.
+     */
+    template <                                     //
+        typename value_at,                         //
+        typename metric_at,                        //
+        typename predicate_at = dummy_predicate_t, //
+        typename prefetch_at = dummy_prefetch_t    //
+        >
+    eloq_search_result_t search(const EloqVecTableName& table_name,           //
+                                value_at&& query,                             //
+                                std::size_t wanted,                           //
+                                TransactionExecution* txm,                    //
+                                metric_at&& metric,                           //
+                                const HNSWMetaRecord<vector_key_t>& metadata, //
+                                index_search_config_t config = {},            //
+                                predicate_at&& predicate = predicate_at{},    //
+                                prefetch_at&& prefetch = prefetch_at{}) const usearch_noexcept_m {
+
+        // Someone is gonna fuzz this, so let's make sure we cover the basics
+        if (!wanted) {
+            return eloq_search_result_t{};
+        }
+
+        // Expansion factor set to zero is equivalent to the default value
+        if (!config.expansion) {
+            config.expansion = default_expansion_search();
+        }
+
+        // Using references is cleaner, but would result in UBSan false positives
+        // context_t* context_ptr = contexts_.data() ? contexts_.data() + config.thread : nullptr;
+        context_wrapper ctx_wrapper;
+        context_t* context_ptr = ctx_wrapper.ctx_;
+        assert(context_ptr != nullptr);
+
+        eloq_top_candidates_t* top_ptr = context_ptr ? &context_ptr->eloq_top_candidates : nullptr;
+        eloq_search_result_t result;
+
+        // usearch_assert_m(contexts_.size() > config.thread, "Thread index out of bounds");
+
+        context_t& context = *context_ptr;
+        eloq_top_candidates_t& top = *top_ptr;
+        // Go down the level, tracking only the closest match
+        result.computed_distances = context.computed_distances;
+        result.visited_members = context.iteration_cycles;
+
+        if (config.exact) {
+            // TODO(ycw): Not implemented by now.
+            return result.failed(VectorStoreError::Undefined);
+            if (!top.reserve(wanted)) {
+                return result.failed(VectorStoreError::OutOfMemory);
+            }
+            search_exact_(query, metric, predicate, wanted, context, txm);
+        } else {
+            eloq_next_candidates_t& next = context.eloq_next_candidates;
+            std::size_t expansion = (std::max)(config.expansion, wanted);
+            usearch_assert_m(expansion > 0, "Expansion factor can't be a zero!");
+            if (!next.reserve(expansion)) {
+                return result.failed(VectorStoreError::OutOfMemory);
+            }
+            if (!top.reserve(expansion)) {
+                return result.failed(VectorStoreError::OutOfMemory);
+            }
+
+            level_t max_level_copy = metadata.max_level_;
+            vector_key_t closest_key = metadata.entry_key_;
+
+            auto start = TimeCounter::CurrentTimeNano();
+
+            result.status =
+                search_for_one_(table_name, query, metric, txm, prefetch, closest_key, max_level_copy, 0, context);
+            if (result.status != VectorStoreError::NoError) {
+                return result;
+            }
+            // StatCollector::Collect("search_one_latencies", EloqVec::TimeCounter::CurrentTimeNano() - start);
+
+            start = TimeCounter::CurrentTimeNano();
+            // For bottom layer we need a more optimized procedure
+            result.status = search_to_find_in_base_(table_name, query, metric, txm, predicate, prefetch, closest_key,
+                                                    expansion, context);
+            if (result.status != VectorStoreError::NoError) {
+                return result;
+            }
+            // StatCollector::Collect("search_find_in_base_latencies", EloqVec::TimeCounter::CurrentTimeNano() - start);
+        }
+
+        top.sort_ascending();
+        top.shrink(wanted);
+
+        // Normalize stats
+        result.computed_distances = context.computed_distances - result.computed_distances;
+        result.visited_members = context.iteration_cycles - result.visited_members;
+        result.set_result(top);
+        return result;
+    }
+
+    VectorStoreError remove(const EloqVecTableName& table_name, const vector_key_t& key,
+                            txservice::TransactionExecution* txm) {
+        VectorRecord vec_record;
+
+        VectorStoreError status =
+            VectorStoreInterface::GetVector(table_name.data_table_name, key, vec_record, txm, false);
+
+        if (status == VectorStoreError::NoError) {
+            if (vec_record.IsDeleted()) {
+                status = VectorStoreError::IsDeleted;
+            } else {
+                vec_record.MarkDeleted();
+                VectorStoreInterface::UpsertVector(table_name.data_table_name, key, vec_record, txm,
+                                                   OperationType::Update);
+            }
+        }
+
+        return status;
+    }
+#endif
 
     /**
      *  @brief Identifies the closest cluster to the given ::query. Thread-safe.
@@ -3794,6 +4408,56 @@ class index_gt {
         return top_view;
     }
 
+#if (WITH_VECTOR_STORE)
+    template <typename metric_at, bool require_non_empty_ak = false>
+    VectorStoreError form_links_to_closest_( //
+        const TableName& data_table_name, metric_at&& metric, VectorNeighbourRecord<vector_key_t>& neighbour_record,
+        level_t level, txservice::TransactionExecution* txm, context_t& context,
+        eloq_candidates_view_t& top_view) usearch_noexcept_m {
+
+        VectorStoreError status = VectorStoreError::NoError;
+        eloq_top_candidates_t& top = context.eloq_top_candidates;
+        usearch_assert_m(top.size() || !require_non_empty_ak, "No candidates found");
+
+        vector_candidate_t* top_data = top.data();
+        std::unordered_map<vector_key_t, VectorRecord> key_to_record;
+        key_to_record.reserve(top.size());
+
+        size_t default_prefetch_size = config_.connectivity;
+        size_t prefetch_cnt = std::min(default_prefetch_size, top.size());
+        std::vector<vector_key_t> read_keys(prefetch_cnt);
+        std::vector<VectorRecord> read_records(prefetch_cnt);
+        for (size_t i = 0; i < prefetch_cnt; i++) {
+            read_keys[i] = *top_data[i].slot;
+        }
+
+        status = VectorStoreInterface::BatchGetVector(data_table_name, read_keys, read_records, txm);
+        if (status != VectorStoreError::NoError) {
+            return status;
+        }
+
+        for (size_t i = 0; i < prefetch_cnt; i++) {
+            key_to_record.emplace(read_keys[i], std::move(read_records[i]));
+        }
+
+        status = refine_(data_table_name, metric, config_.connectivity, top, key_to_record, txm, context,
+                         context.computed_distances_in_refines, top_view);
+        if (status == VectorStoreError::NoError) {
+            usearch_assert_m(top_view.size() || !require_non_empty_ak, "This would lead to isolated nodes");
+
+            auto& new_neighbors = neighbour_record.GetNeighbours(level);
+            usearch_assert_m(!new_neighbors.size(), "The newly inserted element should have blank link list");
+            for (std::size_t idx = 0; idx != top_view.size(); idx++) {
+                // usearch_assert_m(!new_neighbors[idx], "Possible memory corruption");
+                // usearch_assert_m(level <= node_at_(top_view[idx].slot).level(), "Linking to missing level");
+                new_neighbors.push_back(*top_view[idx].slot);
+            }
+        }
+
+        return status;
+    }
+#endif
+
     template <typename value_at, typename metric_at>
     void form_reverse_links_( //
         metric_at&& metric, compressed_slot_t new_slot, candidates_view_t new_neighbors, value_at&& value,
@@ -3843,6 +4507,99 @@ class index_gt {
                 close_header.push_back(top_view[idx].slot);
         }
     }
+
+#if (WITH_VECTOR_STORE)
+
+    template <typename value_at, typename metric_at>
+    VectorStoreError form_reverse_links_( //
+        const EloqVecTableName& table_name, metric_at&& metric, const vector_key_t& new_key,
+        eloq_candidates_view_t new_neighbors, value_at&& value, level_t level, txservice::TransactionExecution* txm,
+        context_t& context) usearch_noexcept_m {
+
+        std::size_t const connectivity_max = level ? config_.connectivity : config_.connectivity_base;
+        std::size_t neighbor_cnt = new_neighbors.size();
+        std::vector<vector_key_t> neighbor_keys(neighbor_cnt);
+        std::vector<VectorNeighbourRecord<vector_key_t>> neighbor_records(neighbor_cnt);
+
+        for (std::size_t i = 0; i != neighbor_cnt; ++i) {
+            neighbor_keys[i] = *new_neighbors[i].slot;
+        }
+
+        VectorStoreError status = VectorStoreError::NoError;
+        status = VectorStoreInterface::BatchGetNeighborRecord(table_name.neighbour_table_name, neighbor_keys,
+                                                              neighbor_records, txm, true);
+        if (status != VectorStoreError::NoError) {
+            return status;
+        }
+
+        for (std::size_t i = 0; i != neighbor_cnt; ++i) {
+            const vector_key_t& close_key = neighbor_keys[i];
+            if (close_key == new_key) {
+                continue;
+            }
+
+            std::vector<vector_key_t>& close_neighbors = neighbor_records[i].GetNeighbours(level);
+
+            // The node may have no neighbors only in one case, when it's the first one in the index,
+            // but that is problematic to track in multi-threaded environments, where the order of insertion
+            // is not guaranteed.
+            usearch_assert_m(close_neighbors.size() <= connectivity_max, "Possible corruption - overflow");
+
+            // If `new_slot` is already present in the neighboring connections of `close_slot`
+            // then no need to modify any connections or run the heuristics.
+            if (close_neighbors.size() < connectivity_max) {
+                close_neighbors.push_back(new_key);
+                VectorStoreInterface::UpsertNeighborRecord(table_name.neighbour_table_name, close_key,
+                                                           std::move(neighbor_records[i]), txm, OperationType::Update);
+                continue;
+            }
+
+            // To fit a new connection we need to drop an existing one.
+            eloq_top_candidates_t& top_for_refine = context.eloq_top_for_refine;
+            top_for_refine.clear();
+            top_for_refine.reserve(connectivity_max + 1);
+            usearch_assert_m((top_for_refine.capacity() >= (close_neighbors.size() + 1)),
+                             "The memory must have been reserved in `add`");
+
+            std::vector<vector_key_t> read_keys = std::move(close_neighbors);
+            read_keys.emplace_back(close_key);
+            std::vector<VectorRecord> read_records(read_keys.size());
+
+            status = VectorStoreInterface::BatchGetVector(table_name.data_table_name, read_keys, read_records, txm);
+            if (status != VectorStoreError::NoError) {
+                return status;
+            }
+            VectorRecord& close_vec_record = read_records.back();
+            std::unordered_map<vector_key_t, VectorRecord> key_to_record;
+            key_to_record.reserve(read_keys.size());
+
+            top_for_refine.insert_reserved({context.measure(value, close_vec_record.RawData(), metric), &new_key});
+            key_to_record.emplace(new_key,
+                                  VectorRecord{reinterpret_cast<const float*>(value), VectorUtils::default_dim});
+            for (size_t i = 0; i < read_keys.size() - 1; i++) {
+                top_for_refine.insert_reserved(
+                    {context.measure(close_vec_record.RawData(), read_records[i].RawData(), metric), &read_keys[i]});
+                key_to_record.emplace(read_keys[i], std::move(read_records[i]));
+            }
+            eloq_candidates_view_t top_view;
+            status = refine_(table_name.data_table_name, metric, connectivity_max, top_for_refine, key_to_record, txm,
+                             context, context.computed_distances_in_reverse_refines, top_view);
+            if (status != VectorStoreError::NoError) {
+                return status;
+            }
+            std::vector<vector_key_t> new_close_neighbours(top_view.size());
+            usearch_assert_m(top_view.size(), "This would lead to isolated nodes");
+            for (std::size_t idx = 0; idx != top_view.size(); idx++) {
+                new_close_neighbours[idx] = std::move(*top_view[idx].slot);
+            }
+            neighbor_records[i].SetNeighbours(level, std::move(new_close_neighbours));
+            VectorStoreInterface::UpsertNeighborRecord(table_name.neighbour_table_name, close_key,
+                                                       std::move(neighbor_records[i]), txm, OperationType::Update);
+        }
+        return VectorStoreError::NoError;
+    }
+
+#endif
 
     level_t choose_random_level_(std::default_random_engine& level_generator) const noexcept {
         std::uniform_real_distribution<double> distribution(0.0, 1.0);
@@ -3954,6 +4711,58 @@ class index_gt {
         return closest_slot;
     }
 
+#if (WITH_VECTOR_STORE)
+    template <typename value_at, typename metric_at, typename prefetch_at = dummy_prefetch_t>
+    VectorStoreError search_for_one_( //
+        const EloqVecTableName& table_name, value_at&& query, metric_at&& metric, txservice::TransactionExecution* txm,
+        prefetch_at&& prefetch, vector_key_t& closest_key, level_t begin_level, level_t end_level,
+        context_t& context) const noexcept {
+
+        VectorRecord vec_record;
+        VectorStoreError status = VectorStoreError::NoError;
+        status = VectorStoreInterface::GetVector(table_name.data_table_name, closest_key, vec_record, txm);
+        if (status != VectorStoreError::NoError) {
+            return status;
+        }
+        distance_t closest_dist = context.measure(query, vec_record.RawData(), metric);
+        for (level_t level = begin_level; level > end_level; --level) {
+            bool changed;
+            do {
+                changed = false;
+                std::vector<vector_key_t> closest_neighbors;
+
+                status = VectorStoreInterface::GetOneLevelNeighbors(table_name.neighbour_table_name, closest_key, level,
+                                                                    closest_neighbors, txm);
+                if (status != VectorStoreError::NoError) {
+                    return status;
+                }
+
+                std::vector<VectorRecord> candidate_records(closest_neighbors.size());
+
+                status = VectorStoreInterface::BatchGetVector(table_name.data_table_name, closest_neighbors,
+                                                              candidate_records, txm);
+                if (status != VectorStoreError::NoError) {
+                    return status;
+                }
+
+                for (auto i = 0; i < closest_neighbors.size(); i++) {
+                    vector_key_t& candidate_key = closest_neighbors[i];
+                    VectorRecord& candidate_record = candidate_records[i];
+                    // VectorStoreInterface::GetVector(candidate_key, candidate_record, txm);
+                    distance_t candidate_dist = context.measure(query, candidate_record.RawData(), metric);
+                    if (candidate_dist < closest_dist) {
+                        closest_dist = candidate_dist;
+                        closest_key = std::move(candidate_key);
+                        changed = true;
+                    }
+                }
+                context.iteration_cycles++;
+            } while (changed);
+        }
+        return VectorStoreError::NoError;
+    }
+
+#endif
     /**
      *  @brief  Traverses a layer of a graph, to find the best place to insert a new node.
      *          Locks the nodes in the process, assuming other threads are updating neighbors lists.
@@ -4029,6 +4838,102 @@ class index_gt {
         }
         return true;
     }
+
+#if (WITH_VECTOR_STORE)
+    /**
+     *  @brief  Traverses a layer of a graph, to find the best place to insert a new node.
+     *          Locks the nodes in the process, assuming other threads are updating neighbors lists.
+     *  @return `true` if procedure succeeded, `false` if run out of memory.
+     */
+    template <typename value_at, typename metric_at, typename prefetch_at = dummy_prefetch_t>
+    VectorStoreError search_to_insert_( //
+        const EloqVecTableName& table_name, value_at&& query, metric_at&& metric, txservice::TransactionExecution* txm,
+        prefetch_at&& prefetch, //
+        const vector_key_t& start_key, level_t level, std::size_t top_limit, context_t& context) noexcept {
+
+        VectorStoreError status = VectorStoreError::NoError;
+        eloq_visits_hash_set_t& visits = context.eloq_visits;
+        eloq_next_candidates_t& next = context.eloq_next_candidates; // pop min, push
+        eloq_top_candidates_t& top = context.eloq_top_candidates;    // pop max, push
+
+        // TODO(ycw): remove this later, when vector key is always a integer, we don't need it anymore
+        eloq_candidate_list_t& caches = context.eloq_cache_candidates;
+
+        visits.clear();
+        next.clear();
+        top.clear();
+        caches.clear();
+
+        // At the very least we are going to explore the starting node and its neighbors
+        if (!visits.reserve(config_.connectivity_base + 1u))
+            return VectorStoreError::OutOfMemory;
+
+        VectorRecord vec_record;
+        status = VectorStoreInterface::GetVector(table_name.data_table_name, start_key, vec_record, txm);
+        if (status != VectorStoreError::NoError) {
+            return status;
+        }
+        distance_t radius = context.measure(query, vec_record.RawData(), metric);
+
+        caches.push_back(start_key);
+        next.insert_reserved({-radius, &caches.back()});
+        top.insert_reserved({radius, &caches.back()});
+        visits.set(&caches.back());
+
+        // The primary loop of the graph traversal
+        while (!next.empty()) {
+
+            vector_candidate_t candidacy = next.top();
+            if ((-candidacy.distance) > radius && top.size() == top_limit) {
+                break;
+            }
+
+            next.pop();
+            context.iteration_cycles++;
+
+            auto candidate_key = *candidacy.slot;
+            std::vector<vector_key_t> candidate_neighbors;
+            status = VectorStoreInterface::GetOneLevelNeighbors(table_name.neighbour_table_name, candidate_key, level,
+                                                                candidate_neighbors, txm);
+            if (status != VectorStoreError::NoError) {
+                return status;
+            }
+
+            // Assume the worst-case when reserving memory
+            if (!visits.reserve(visits.size() + candidate_neighbors.size())) {
+                return VectorStoreError::OutOfMemory;
+            }
+
+            std::vector<VectorRecord> records(candidate_neighbors.size());
+            status =
+                VectorStoreInterface::BatchGetVector(table_name.data_table_name, candidate_neighbors, records, txm);
+            if (status != VectorStoreError::NoError) {
+                return status;
+            }
+
+            for (std::size_t i = 0; i < candidate_neighbors.size(); ++i) {
+                caches.push_back(std::move(candidate_neighbors[i]));
+                const vector_key_t& key = caches.back();
+                if (visits.set(&key)) {
+                    continue;
+                }
+
+                // We don't access the neighbors of the `successor_slot` node,
+                // so we don't have to lock it.
+                // node_lock_t successor_lock = node_lock_(successor_slot);
+                distance_t dist = context.measure(query, records[i].RawData(), metric);
+                if (top.size() < top_limit || dist < radius) {
+                    // This can substantially grow our priority queue:
+                    next.insert({-dist, &key});
+                    // This will automatically evict poor matches:
+                    top.insert({dist, &key}, top_limit);
+                    radius = top.top().distance;
+                }
+            }
+        }
+        return VectorStoreError::NoError;
+    }
+#endif
 
     /**
      *  @brief  Traverses a layer of a graph, to find the best neighbors list for updated node.
@@ -4196,6 +5101,140 @@ class index_gt {
         return true;
     }
 
+#if (WITH_VECTOR_STORE)
+
+    /**
+     *  @brief  Traverses the @b base layer of a graph, to find a close match.
+     *          Doesn't lock any nodes, assuming read-only simultaneous access.
+     *  @return `true` if procedure succeeded, `false` if run out of memory.
+     */
+    template <typename value_at, typename metric_at, typename predicate_at, typename prefetch_at>
+    VectorStoreError search_to_find_in_base_( //
+        const EloqVecTableName& table_name, value_at&& query, metric_at&& metric, TransactionExecution* txm,
+        predicate_at&& predicate, prefetch_at&& prefetch, const vector_key_t& start_key, std::size_t expansion,
+        context_t& context) const usearch_noexcept_m {
+
+        eloq_visits_hash_set_t& visits = context.eloq_visits;
+        eloq_next_candidates_t& next = context.eloq_next_candidates; // pop min, push
+        eloq_top_candidates_t& top = context.eloq_top_candidates;    // pop max, push
+        eloq_candidate_list_t& caches = context.eloq_cache_candidates;
+        std::size_t const top_limit = expansion;
+
+        visits.clear();
+        next.clear();
+        top.clear();
+
+        auto start = TimeCounter::CurrentTimeNano();
+        caches.clear();
+        // StatCollector::Collect("clear_cache_latencies", TimeCounter::CurrentTimeNano() - start);
+
+        if (!visits.reserve(config_.connectivity_base + 1u)) {
+            return VectorStoreError::OutOfMemory;
+        }
+
+        VectorStoreError status = VectorStoreError::NoError;
+        VectorRecord vec_record;
+        // start = TimeCounter::CurrentTimeNano();
+        status = VectorStoreInterface::GetVector(table_name.data_table_name, start_key, vec_record, txm);
+        if (status != VectorStoreError::NoError) {
+            return status;
+        }
+        // StatCollector::Collect("get_vector_latencies", TimeCounter::CurrentTimeNano() - start);
+
+        // start = TimeCounter::CurrentTimeNano;
+        distance_t radius = context.measure(query, vec_record.RawData(), metric);
+        // StatCollector::Collect("measure_latencies", TimeCounter::CurrentTimeNano() - start);
+        usearch_assert_m(next.capacity(), "The `max_heap_gt` must have been reserved in the search entry point");
+
+        // start = TimeCounter::CurrentTimeNano();
+        next.insert_reserved({-radius, &start_key});
+        // StatCollector::Collect("next_latencies", TimeCounter::CurrentTimeNano() - start);
+
+        // start = TimeCounter::CurrentTimeNano();
+        visits.set(&start_key);
+        // StatCollector::Collect("visits_latencies", TimeCounter::CurrentTimeNano() - start);
+
+        if (!vec_record.IsDeleted()) {
+            // start = TimeCounter::CurrentTimeNano();
+            top.insert_reserved({radius, &start_key});
+            // StatCollector::Collect("top_latencies", TimeCounter::CurrentTimeNano() - start);
+        }
+
+        while (!next.empty()) {
+
+            eloq_candidate_t candidate = next.top();
+            if ((-candidate.distance) > radius && top.size() == top_limit) {
+                break;
+            }
+
+            // auto start = TimeCounter::CurrentTimeNano();
+            next.pop();
+            // StatCollector::Collect("next_latencies", TimeCounter::CurrentTimeNano() - start);
+            context.iteration_cycles++;
+
+            auto candidate_key = *candidate.slot;
+            std::vector<vector_key_t> candidate_neighbors;
+            // start = TimeCounter::CurrentTimeNano();
+            status = VectorStoreInterface::GetOneLevelNeighbors(table_name.neighbour_table_name, candidate_key, 0,
+                                                                candidate_neighbors, txm);
+            if (status != VectorStoreError::NoError) {
+                return status;
+            }
+            // StatCollector::Collect("get_one_level_neighbors_latencies", TimeCounter::CurrentTimeNano() - start);
+            // Assume the worst-case when reserving memory
+            if (!visits.reserve(visits.size() + candidate_neighbors.size())) {
+                return VectorStoreError::OutOfMemory;
+            }
+
+            std::vector<VectorRecord> successor_records(candidate_neighbors.size());
+
+            status = VectorStoreInterface::BatchGetVector(table_name.data_table_name, candidate_neighbors,
+                                                          successor_records, txm);
+            if (status != VectorStoreError::NoError) {
+                return status;
+            }
+
+            for (auto i = 0; i < candidate_neighbors.size(); i++) {
+                auto& successor_key = candidate_neighbors[i];
+                auto start = TimeCounter::CurrentTimeNano();
+                caches.push_back(std::move(successor_key));
+                const vector_key_t& key = caches.back();
+                // StatCollector::Collect("cache_latencies", TimeCounter::CurrentTimeNano() - start);
+
+                // start = TimeCounter::CurrentTimeNano();
+                if (visits.set(&key)) {
+                    // StatCollector::Collect("visits_latencies", TimeCounter::CurrentTimeNano() - start);
+                    continue;
+                }
+                // StatCollector::Collect("visits_latencies", TimeCounter::CurrentTimeNano() - start);
+
+                auto& successor_record = successor_records[i];
+                // start = TimeCounter::CurrentTimeNano();
+                distance_t successor_dist = context.measure(query, successor_record.RawData(), metric);
+                // StatCollector::Collect("measure_latencies", TimeCounter::CurrentTimeNano() - start);
+                if (top.size() < top_limit || successor_dist < radius) {
+                    // This can substantially grow our priority queue:
+
+                    // start = TimeCounter::CurrentTimeNano();
+                    next.insert({-successor_dist, &key});
+                    // StatCollector::Collect("next_latencies", TimeCounter::CurrentTimeNano() - start);
+
+                    // start = TimeCounter::CurrentTimeNano();
+
+                    if (!successor_record.IsDeleted()) {
+                        top.insert({successor_dist, &key}, top_limit);
+                    }
+                    radius = top.top().distance;
+                    // StatCollector::Collect("top_latencies", TimeCounter::CurrentTimeNano() - start);
+                }
+            }
+        }
+
+        return VectorStoreError::NoError;
+    }
+
+#endif
+
     /**
      *  @brief  Iterates through all members, without actually touching the index.
      */
@@ -4217,6 +5256,34 @@ class index_gt {
             top.insert(candidate_t{distance, slot}, count);
         }
     }
+
+#if (WITH_VECTOR_STORE)
+
+    /**
+     *  @brief  Iterates through all members, without actually touching the index.
+     */
+    template <typename value_at, typename metric_at, typename predicate_at>
+    void search_exact_(                                                 //
+        value_at&& query, metric_at&& metric, predicate_at&& predicate, //
+        std::size_t count, context_t& context, TransactionExecution* txm) const noexcept {
+
+        assert(false); // To be Implemented
+
+        // top_candidates_t& top = context.top_candidates;
+        // top.clear();
+        // top.reserve(count);
+        // for (std::size_t i = 0; i != size(); ++i) {
+        //     auto slot = static_cast<compressed_slot_t>(i);
+        //     if (!is_dummy<predicate_at>())
+        //         if (!predicate(at(slot)))
+        //             continue;
+
+        //     distance_t distance = context.measure(query, citerator_at(slot), metric);
+        //     top.insert(candidate_t{distance, slot}, count);
+        // }
+    }
+
+#endif
 
     /**
      *  @brief  This algorithm from the original paper implements a heuristic,
@@ -4267,6 +5334,93 @@ class index_gt {
         top.shrink(submitted_count);
         return {top_data, submitted_count};
     }
+
+#if (WITH_VECTOR_STORE)
+
+    static VectorStoreError GetVector(const TableName& data_table_name, const vector_key_t& key, VectorRecord*& record,
+                                      std::unordered_map<vector_key_t, VectorRecord>& key_to_record,
+                                      TransactionExecution* txm) {
+        VectorStoreError status = VectorStoreError::NoError;
+        auto it = key_to_record.find(key);
+        if (it == key_to_record.end()) {
+            VectorRecord new_record;
+            status = VectorStoreInterface::GetVector(data_table_name, key, new_record, txm);
+            if (status != VectorStoreError::NoError) {
+                return status;
+            }
+            it = key_to_record.emplace(key, std::move(new_record)).first;
+        }
+
+        record = &it->second;
+        return status;
+    }
+
+    /**
+     *  @brief  This algorithm from the original paper implements a heuristic,
+     *          that massively reduces the number of connections a point has,
+     *          to keep only the neighbors, that are from each other.
+     */
+    template <typename metric_at>
+    VectorStoreError refine_( //
+        const TableName& data_table_name, metric_at&& metric, std::size_t needed, eloq_top_candidates_t& top,
+        std::unordered_map<vector_key_t, VectorRecord>& key_to_record, TransactionExecution* txm, context_t& context,
+        std::size_t& refines_counter, eloq_candidates_view_t& top_view) const noexcept {
+
+        // Avoid expensive computation, if the set is already small
+        vector_candidate_t* top_data = top.data();
+        std::size_t const top_count = top.size();
+        if (top_count < needed) {
+            top_view = {top_data, top_count};
+            return VectorStoreError::NoError;
+        }
+
+        // Sort before processing
+        top.sort_ascending();
+
+        std::size_t submitted_count = 1;
+        std::size_t consumed_count = 1; /// Always equal or greater than `submitted_count`.
+        while (submitted_count < needed && consumed_count < top_count) {
+            vector_candidate_t candidate = top_data[consumed_count];
+            bool good = true;
+            std::size_t idx = 0;
+            for (; idx < submitted_count; idx++) {
+                vector_candidate_t submitted = top_data[idx];
+                VectorRecord* candidate_record{nullptr};
+                VectorRecord* submitted_record{nullptr};
+
+                VectorStoreError status =
+                    GetVector(data_table_name, *candidate.slot, candidate_record, key_to_record, txm);
+                if (status == VectorStoreError::NoError) {
+                    status = GetVector(data_table_name, *submitted.slot, submitted_record, key_to_record, txm);
+                }
+                if (status != VectorStoreError::NoError) {
+                    return status;
+                }
+
+                distance_t inter_result_dist = context.measure( //
+                    candidate_record->RawData(),                //
+                    submitted_record->RawData(),                //
+                    metric);
+                if (inter_result_dist < candidate.distance) {
+                    good = false;
+                    break;
+                }
+            }
+            refines_counter += idx;
+
+            if (good) {
+                top_data[submitted_count] = top_data[consumed_count];
+                submitted_count++;
+            }
+            consumed_count++;
+        }
+
+        top.shrink(submitted_count);
+        top_view = {top_data, submitted_count};
+        return VectorStoreError::NoError;
+    }
+
+#endif
 };
 
 struct join_result_t {
@@ -4492,6 +5646,14 @@ static join_result_t join(               //
     result.visited_members = visited_members;
     return result;
 }
+
+// Define thread_local static member for index_gt class template
+#if (WITH_VECTOR_STORE)
+template <typename distance_at, typename key_at, typename label_at, typename allocator_at, typename viewing_at>
+thread_local std::queue<
+    typename unum::usearch::index_gt<distance_at, key_at, label_at, allocator_at, viewing_at>::context_t*>
+    unum::usearch::index_gt<distance_at, key_at, label_at, allocator_at, viewing_at>::free_contexts_;
+#endif
 
 } // namespace usearch
 } // namespace unum

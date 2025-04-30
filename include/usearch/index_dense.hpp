@@ -15,6 +15,14 @@
 #include <shared_mutex> // `std::shared_mutex`
 #endif
 
+#if (WITH_VECTOR_STORE)
+    #include <string_view>
+    #include <cassert>
+    #include "tx_execution.h"
+    #include "vector_record.h"
+    #include "vector_utils.h"
+#endif
+
 namespace unum {
 namespace usearch {
 
@@ -446,6 +454,18 @@ class index_dense_gt {
     mutable cast_buffer_t cast_buffer_;
     casts_punned_t casts_;
 
+#if (WITH_VECTOR_STORE)
+    static cast_buffer_t& get_vector_cast_buffer(metric_t const& metric) {
+        static thread_local cast_buffer_t buffer;
+        size_t bytes_per_vector = metric.bytes_per_vector();
+        if (buffer.size() == 0 || buffer.size() < bytes_per_vector) {
+            cast_buffer_t new_buffer = cast_buffer_t(bytes_per_vector);
+            buffer = std::move(new_buffer);
+        }
+        return buffer;
+    }
+#endif
+
     /// @brief An instance of a potentially stateful `metric_t` used to initialize copies and forks.
     metric_t metric_;
 
@@ -537,6 +557,9 @@ class index_dense_gt {
   public:
     using cluster_result_t = typename index_t::cluster_result_t;
     using add_result_t = typename index_t::add_result_t;
+#if (WITH_VECTOR_STORE)
+    using eloq_add_result_t = typename index_t::eloq_add_result_t;
+#endif
     using stats_t = typename index_t::stats_t;
     using match_t = typename index_t::match_t;
 
@@ -562,6 +585,17 @@ class index_dense_gt {
         inline search_result_t(typename index_t::search_result_t result, thread_lock_t lock) noexcept
             : index_t::search_result_t(std::move(result)), lock_(std::move(lock)) {}
     };
+
+#if (WITH_VECTOR_STORE)
+    /**
+     *  @brief  A search result, containing the found keys and distances.
+     *
+     *  As the `index_dense_gt` manages the thread-pool on its own, the search result
+     *  preserves the thread-lock to avoid undefined behaviors, when other threads
+     *  start overwriting the results.
+     */
+     using eloq_search_result_t = typename index_t::eloq_search_result_t;
+#endif
 
     index_dense_gt() = default;
     index_dense_gt(index_dense_gt&& other)
@@ -672,6 +706,35 @@ class index_dense_gt {
         return result;
     }
 
+#if (WITH_VECTOR_STORE)
+    // for eloqvec, metric and some other config each time we do vector add or search.
+    static state_result_t make_for_eloqvec(           //
+        index_dense_config_t config = {}) {
+
+        error_t error = config.validate();
+        if (error)
+            return state_result_t{}.failed(std::move(error));
+        index_t* raw = index_allocator_t{}.allocate(1);
+        if (!raw)
+            return state_result_t{}.failed("Failed to allocate memory for the index!");
+
+        state_result_t result;
+        index_dense_gt& index = result.index;
+        index.config_ = config;
+
+        // In some cases the metric is not provided, and will be set later.
+        // if (metric) {
+        //     scalar_kind_t scalar_kind = metric.scalar_kind();
+        //     index.casts_ = casts_punned_t::make(scalar_kind);
+        //     index.metric_ = metric;
+        // }
+
+        new (raw) index_t(config);
+        index.typed_ = raw;
+        return result;
+    }
+#endif
+
     /**
      *  @brief Constructs an instance of ::index_dense_gt from a serialized binary file.
      *  @param[in] path The path to the binary file.
@@ -763,11 +826,29 @@ class index_dense_gt {
     add_result_t add(vector_key_t key, f32_t const* vector, std::size_t thread = any_thread(), bool force_vector_copy = true) { return add_(key, vector, thread, force_vector_copy, casts_.from.f32); }
     add_result_t add(vector_key_t key, f64_t const* vector, std::size_t thread = any_thread(), bool force_vector_copy = true) { return add_(key, vector, thread, force_vector_copy, casts_.from.f64); }
 
+#if (WITH_VECTOR_STORE)
+    // eloq_add_result_t add(std::string_view table_name, const vector_key_t &key, b1x8_t const* vector, TransactionExecution *txm) { return add_(table_name, key, vector, txm); }
+    // eloq_add_result_t add(std::string_view table_name, const vector_key_t &key, i8_t const* vector, TransactionExecution *txm) { return add_(table_name, key, vector, txm); }
+    // eloq_add_result_t add(std::string_view table_name, const vector_key_t &key, f16_t const* vector, TransactionExecution *txm) { return add_(table_name, key, vector, txm); }
+    eloq_add_result_t add(const EloqVecTableName &table_name, const vector_key_t &key, f32_t const* vector, HNSWMetaRecord<vector_key_t> &metadata, TransactionExecution *txm) { return add_(table_name, key, vector, metadata, txm); }
+    // eloq_add_result_t add(std::string_view table_name, const vector_key_t &key, f64_t const* vector, TransactionExecution *txm) { return add_(table_name, key, vector, txm); }
+
+#endif
+
     search_result_t search(b1x8_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from.b1x8); }
     search_result_t search(i8_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from.i8); }
     search_result_t search(f16_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from.f16); }
     search_result_t search(f32_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from.f32); }
     search_result_t search(f64_t const* vector, std::size_t wanted, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, dummy_predicate_t {}, thread, exact, casts_.from.f64); }
+
+#if (WITH_VECTOR_STORE)
+    // eloq_search_result_t search(b1x8_t const* vector, std::size_t wanted, TransactionExecution *txm, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, txm, dummy_predicate_t {}, thread, exact, casts_.from.b1x8); }
+    // eloq_search_result_t search(i8_t const* vector, std::size_t wanted, TransactionExecution *txm, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, txm, dummy_predicate_t {}, thread, exact, casts_.from.i8); }
+    // eloq_search_result_t search(f16_t const* vector, std::size_t wanted, TransactionExecution *txm, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, txm, dummy_predicate_t {}, thread, exact, casts_.from.f16); }
+    eloq_search_result_t search(const EloqVecTableName &table_name, f32_t const* vector, std::size_t wanted, const HNSWMetaRecord<vector_key_t> &metadata, TransactionExecution *txm, bool exact = false) const { return search_(table_name, vector, wanted, metadata, txm, dummy_predicate_t {}, exact); }
+    // eloq_search_result_t search(f64_t const* vector, std::size_t wanted, TransactionExecution *txm, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, txm, dummy_predicate_t {}, thread, exact, casts_.from.f64); }
+
+#endif
 
     template <typename predicate_at> search_result_t filtered_search(b1x8_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from.b1x8); }
     template <typename predicate_at> search_result_t filtered_search(i8_t const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread = any_thread(), bool exact = false) const { return search_(vector, wanted, std::forward<predicate_at>(predicate), thread, exact, casts_.from.i8); }
@@ -1495,6 +1576,10 @@ class index_dense_gt {
         return result;
     }
 
+#if (WITH_VECTOR_STORE)
+    VectorStoreError remove(const EloqVecTableName &table_name, const vector_key_t& key, txservice::TransactionExecution* txm) { return typed_->remove(table_name, key, txm); }
+#endif
+
     /**
      *  @brief Removes multiple entries with the specified keys from the index.
      *  @param[in] keys_begin The beginning of the keys range.
@@ -2034,6 +2119,43 @@ class index_dense_gt {
                    : typed_->add(key, vector_data, metric, update_config, on_success);
     }
 
+#if (WITH_VECTOR_STORE)
+    template <typename scalar_at>
+    eloq_add_result_t add_(                               //
+        const EloqVecTableName &table_name, const vector_key_t& key, scalar_at const* vector, //
+        HNSWMetaRecord<vector_key_t> &metadata, txservice::TransactionExecution* txm) {
+
+        auto metric = metric_punned_t{metadata.dimensions_,
+                            metric_kind_t::l2sq_k,
+                            scalar_kind_t::f32_k};
+
+        // scalar_kind_t scalar_kind = metric.scalar_kind();
+        // index.casts_ = casts_punned_t::make(scalar_kind);
+        // this->metric_ = metric;
+
+        // Cast the vector, if needed for compatibility with `metric_`
+        auto const* vector_data = reinterpret_cast<byte_t const*>(vector);
+        // {
+        //     // TODO(ycw): check this
+        //     byte_t* casted_data = get_vector_cast_buffer(metric_).data();
+        //     bool casted = cast(vector_data, dimensions(), casted_data);
+        //     if (casted) {
+        //         vector_data = casted_data;
+        //     }
+        // }
+
+        index_update_config_t update_config;
+        update_config.expansion = config_.expansion_add;
+
+        // metric_proxy_t metric{*this};
+        // return reuse_node //
+        //            ? typed_->update(typed_->iterator_at(free_slot), key, vector_data, metric, update_config,
+        //            on_success) : typed_->add(key, vector_data, metric, update_config, on_success);
+        return typed_->add(table_name, key, vector_data, metric, txm, metadata, update_config);
+    }
+
+#endif
+
     template <typename scalar_at, typename predicate_at>
     search_result_t search_(scalar_at const* vector, std::size_t wanted, predicate_at&& predicate, std::size_t thread,
                             bool exact, cast_punned_t const& cast) const {
@@ -2068,6 +2190,47 @@ class index_dense_gt {
             return search_result_t{std::move(typed_result), std::move(lock)};
         }
     }
+
+#if (WITH_VECTOR_STORE)
+
+    template <typename scalar_at, typename predicate_at>
+    eloq_search_result_t search_(const EloqVecTableName &table_name, scalar_at const* vector, std::size_t wanted,
+                                 const HNSWMetaRecord<vector_key_t> &metadata, TransactionExecution* txm,
+                                 predicate_at&& predicate/* TODO */, bool exact /* TODO */) const {
+
+        auto metric = metric_punned_t{metadata.dimensions_,
+                            metric_kind_t::l2sq_k,
+                            scalar_kind_t::f32_k};
+
+        auto const* vector_data = reinterpret_cast<byte_t const*>(vector);
+        // {
+        //     // TODO(ycw): check this
+        //     byte_t* casted_data = get_vector_cast_buffer(metric_).data();
+        //     bool casted = cast(vector_data, dimensions(), casted_data);
+        //     if (casted) {
+        //         vector_data = casted_data;
+        //     }
+        // }
+
+        index_search_config_t search_config;
+        // search_config.thread = lock.thread_id;
+        search_config.expansion = config_.expansion_search;
+        search_config.exact = exact;
+
+        if (std::is_same<typename std::decay<predicate_at>::type, dummy_predicate_t>::value) {
+            return typed_->search(table_name, vector_data, wanted, txm, metric, metadata, search_config);
+        }
+        eloq_search_result_t result{};
+        assert(false);
+        return result.failed(VectorStoreError::Undefined);
+        // TODO(ycw): don not support user defined predicate now.
+        // auto allow = [free_key_copy, &predicate](member_cref_t const& member) noexcept {
+        //     return (vector_key_t)member.key != free_key_copy && predicate(member.key);
+        // };
+        // result = typed_->search(vector_data, wanted, txm, metric_proxy_t{*this}, search_config, allow);
+    }
+
+#endif
 
     template <typename scalar_at>
     cluster_result_t cluster_(                      //
